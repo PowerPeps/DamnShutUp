@@ -49,7 +49,7 @@ def normalize(v):
 def top(x):
     t = np.abs(x)
     e = np.clip(1 - t**2, 0, 1)
-    return 0.05 * t**2 + 0.40 * e**0.75 + 0.06 * np.exp(-(((t - 0.24) / 0.13) ** 2)) * e - 0.07 * np.exp(-((t / 0.09) ** 2))
+    return 0.05 * t**2 + 0.40 * e**0.6 + 0.06 * np.exp(-(((t - 0.24) / 0.13) ** 2)) * e - 0.07 * np.exp(-((t / 0.09) ** 2))
 
 
 def mid(x):
@@ -60,7 +60,7 @@ def mid(x):
 
 def bot(x):
     t = np.abs(x)
-    return mid(x) - 0.52 * np.clip(1 - t**2.4, 0, 1) ** 0.75
+    return mid(x) - 0.52 * np.clip(1 - t**2.4, 0, 1) ** 0.6
 
 
 px = (np.arange(N) + 0.5) / SS
@@ -73,9 +73,7 @@ yt, ym, yb = top(lx), mid(lx), bot(lx)
 inside = np.abs(lx) < 1
 aa = 1.2 / (SCALE * SS)
 
-a_up = smoothstep(0, aa, yt - ly) * smoothstep(0, aa, ly - ym) * inside
-a_lo = smoothstep(0, aa, ym - ly) * smoothstep(0, aa, ly - yb) * inside
-alpha_lips = np.clip(a_up + a_lo, 0, 1)
+alpha_lips = smoothstep(0, aa, yt - ly) * smoothstep(0, aa, ly - yb) * inside
 
 v = np.clip((ly - ym) / np.maximum(yt - ym, 1e-4), 0, 1)
 w = np.clip((ym - ly) / np.maximum(ym - yb, 1e-4), 0, 1)
@@ -120,11 +118,26 @@ col += spec[..., None]
 rim = np.exp(-(((1 - v) / 0.05) ** 2)) * is_up * smoothstep(0.0, 0.3, thick)
 col *= 1 + 0.25 * rim[..., None]
 
-line_w = 0.008 + 0.016 * env
+tip = np.exp(-(((1 - t) / 0.06) ** 2))
+line_w = 0.008 + 0.016 * env + 0.014 * tip
 dline = np.exp(-(((ly - ym) / line_w) ** 2)) * inside
 col *= (1 - 0.9 * dline)[..., None]
-corner = np.exp(-(((1 - t) / 0.07) ** 2))
-col *= (1 - 0.65 * corner)[..., None]
+near_line = np.exp(-np.abs(ly - ym) / 0.07)
+recess = smoothstep(0.72, 1.0, t) * (0.35 + 0.65 * near_line)
+col *= (1 - 0.6 * recess)[..., None]
+
+crease_t = np.abs(lx)
+crease_y = ym - 0.5 * np.clip(crease_t - 0.99, 0, None)
+crease_a = (
+    np.exp(-(((ly - crease_y) / (0.003 + 0.009 * smoothstep(1.045, 0.97, crease_t))) ** 2))
+    * smoothstep(1.045, 0.985, crease_t)
+    * (crease_t > 0.9)
+    * 0.85
+)
+crease_col = np.array([0.06, 0.0, 0.006])
+alpha_out = np.maximum(alpha_lips, crease_a)
+col = (col * alpha_lips[..., None] + crease_col * (crease_a * (1 - alpha_lips))[..., None]) / np.maximum(alpha_out, 1e-6)[..., None]
+alpha_lips = alpha_out
 
 # bar
 p0 = np.array([170.0, 170.0])
