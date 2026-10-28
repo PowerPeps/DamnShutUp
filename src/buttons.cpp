@@ -4,8 +4,15 @@
 #include <gdiplus.h>
 #include <windowsx.h>
 
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "audio.h"
+#include "store.h"
 #include "util.h"
 
+namespace buttons {
 namespace {
 
 constexpr wchar_t kButtonClass[] = L"DamnShutUp.TitleBarButton";
@@ -14,7 +21,21 @@ constexpr wchar_t kMuteGlyph = L'';
 constexpr UINT kRecolorDelayMs = 150;
 constexpr float kGlyphSizeAt96Dpi = 11.5f;
 
-TitleBarButtons* g_self = nullptr;
+struct Button {
+    HWND wnd = nullptr;
+    std::wstring exe;
+    RECT rect{};
+    COLORREF caption = RGB(255, 255, 255);
+    bool active = false;
+    bool hover = false;
+    bool pressed = false;
+};
+
+HINSTANCE g_instance = nullptr;
+ULONG_PTR g_gdiplusToken = 0;
+std::vector<HWINEVENTHOOK> g_hooks;
+UINT_PTR g_recolorTimer = 0;
+std::unordered_map<HWND, Button> g_buttons;  // by target window
 
 bool IsTopmost(HWND wnd) { return (GetWindowLongPtrW(wnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0; }
 
@@ -69,184 +90,7 @@ COLORREF SampleCaption(const RECT& button) {
     return color == CLR_INVALID ? RGB(255, 255, 255) : color;
 }
 
-}  // namespace
-
-bool TitleBarButtons::Init(HINSTANCE instance, IsMutedFn isMuted, ToggleFn toggle) {
-    g_self = this;
-    instance_ = instance;
-    isMuted_ = std::move(isMuted);
-    toggle_ = std::move(toggle);
-
-    WNDCLASSEXW wc{sizeof(wc)};
-    wc.lpfnWndProc = &TitleBarButtons::ButtonProc;
-    wc.hInstance = instance;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.lpszClassName = kButtonClass;
-    if (!RegisterClassExW(&wc)) return false;
-
-    Gdiplus::GdiplusStartupInput gdiplusInput;
-    if (Gdiplus::GdiplusStartup(&gdiplusToken_, &gdiplusInput, nullptr) != Gdiplus::Ok) return false;
-
-    const DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
-    const std::pair<DWORD, DWORD> ranges[] = {
-        {EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND},
-        {EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND},
-        {EVENT_OBJECT_DESTROY, EVENT_OBJECT_REORDER},
-        {EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE},
-        {EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED},
-    };
-    for (const auto& [first, last] : ranges)
-        if (HWINEVENTHOOK hook = SetWinEventHook(first, last, nullptr, &TitleBarButtons::OnWinEvent, 0, 0, flags))
-            hooks_.push_back(hook);
-
-    Resync();
-    return true;
-}
-
-void TitleBarButtons::Shutdown() {
-    for (HWINEVENTHOOK hook : hooks_) UnhookWinEvent(hook);
-    hooks_.clear();
-    if (recolorTimer_) KillTimer(nullptr, recolorTimer_);
-    recolorTimer_ = 0;
-    for (auto& [target, button] : buttons_) DestroyWindow(button.wnd);
-    buttons_.clear();
-    if (gdiplusToken_) Gdiplus::GdiplusShutdown(gdiplusToken_);
-    gdiplusToken_ = 0;
-    g_self = nullptr;
-}
-
-void TitleBarButtons::Resync() {
-    for (auto it = buttons_.begin(); it != buttons_.end();) {
-        if (IsWindow(it->first)) {
-            ++it;
-            continue;
-        }
-        DestroyWindow(it->second.wnd);
-        it = buttons_.erase(it);
-    }
-    EnumWindows(
-        [](HWND hwnd, LPARAM self) -> BOOL {
-            reinterpret_cast<TitleBarButtons*>(self)->Sync(hwnd);
-            return TRUE;
-        },
-        reinterpret_cast<LPARAM>(this));
-}
-
-void TitleBarButtons::Refresh(const std::wstring& exe) {
-    for (auto& [target, button] : buttons_)
-        if (button.visible && button.exe == exe) Render(button);
-}
-
-void TitleBarButtons::ScheduleRecolor() {
-    recolorTimer_ = SetTimer(nullptr, recolorTimer_, kRecolorDelayMs, &TitleBarButtons::OnRecolorTimer);
-}
-
-void CALLBACK TitleBarButtons::OnRecolorTimer(HWND, UINT, UINT_PTR id, DWORD) {
-    KillTimer(nullptr, id);
-    if (!g_self) return;
-    g_self->recolorTimer_ = 0;
-    g_self->Recolor();
-}
-
-void CALLBACK TitleBarButtons::OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD,
-                                          DWORD) {
-    if (!g_self) return;
-    if (event == EVENT_SYSTEM_FOREGROUND || event == EVENT_OBJECT_REORDER) {
-        if (event == EVENT_SYSTEM_FOREGROUND && hwnd) g_self->Sync(hwnd);
-        g_self->SyncTracked();
-        g_self->ScheduleRecolor();
-        return;
-    }
-    if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
-    if (event == EVENT_OBJECT_DESTROY)
-        g_self->Remove(hwnd);
-    else
-        g_self->Sync(hwnd);
-}
-
-void TitleBarButtons::Sync(HWND target) {
-    DWORD pid = 0;
-    if (!GetWindowThreadProcessId(target, &pid) || pid == GetCurrentProcessId()) return;
-    auto it = buttons_.find(target);
-    RECT rect;
-    if (!ComputeButtonRect(target, &rect)) {
-        if (it != buttons_.end() && it->second.visible) {
-            ShowWindow(it->second.wnd, SW_HIDE);
-            it->second.visible = false;
-        }
-        return;
-    }
-    if (it == buttons_.end()) {
-        Button button;
-        button.exe = ExePathOfProcess(pid);
-        if (button.exe.empty()) return;
-        button.wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kButtonClass, L"", WS_POPUP, 0,
-                                     0, 0, 0, nullptr, nullptr, instance_, nullptr);
-        if (!button.wnd) return;
-        SetWindowLongPtrW(button.wnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(target));
-        it = buttons_.emplace(target, std::move(button)).first;
-    }
-    Place(target, it->second, rect);
-}
-
-void TitleBarButtons::SyncTracked() {
-    std::vector<HWND> targets;
-    targets.reserve(buttons_.size());
-    for (const auto& [target, button] : buttons_) targets.push_back(target);
-    for (HWND target : targets) Sync(target);
-}
-
-void TitleBarButtons::Remove(HWND target) {
-    const auto it = buttons_.find(target);
-    if (it == buttons_.end()) return;
-    DestroyWindow(it->second.wnd);
-    buttons_.erase(it);
-}
-
-void TitleBarButtons::Place(HWND target, Button& button, const RECT& rect) {
-    const bool active = GetForegroundWindow() == target;
-    const bool moved = !EqualRect(&rect, &button.rect);
-    const bool resized = rect.right - rect.left != button.rect.right - button.rect.left ||
-                         rect.bottom - rect.top != button.rect.bottom - button.rect.top;
-    const bool wasVisible = button.visible;
-    button.rect = rect;
-    if (!wasVisible || resized || active != button.active) {
-        button.active = active;
-        Render(button);
-    }
-    if (!wasVisible || moved) ScheduleRecolor();
-
-    // Keep the overlay directly above its target in the Z order.
-    const bool topmost = IsTopmost(target);
-    if (topmost != IsTopmost(button.wnd))
-        SetWindowPos(button.wnd, topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    HWND above = GetWindow(target, GW_HWNDPREV);
-    if (above == button.wnd && wasVisible && !moved) return;
-    UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW;
-    HWND after = above;
-    if (above == button.wnd)
-        flags |= SWP_NOZORDER;
-    else if (!above || (!topmost && IsTopmost(above)))
-        after = topmost ? HWND_TOPMOST : HWND_TOP;
-    SetWindowPos(button.wnd, after, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, flags);
-    button.visible = true;
-}
-
-void TitleBarButtons::Recolor() {
-    const HWND foreground = GetForegroundWindow();
-    for (auto& [target, button] : buttons_) {
-        if (!button.visible) continue;
-        const COLORREF caption = SampleCaption(button.rect);
-        const bool active = foreground == target;
-        if (caption == button.caption && active == button.active) continue;
-        button.caption = caption;
-        button.active = active;
-        Render(button);
-    }
-}
-
-void TitleBarButtons::Render(Button& button) {
+void Render(Button& button) {
     const int width = button.rect.right - button.rect.left;
     const int height = button.rect.bottom - button.rect.top;
     if (width <= 0 || height <= 0) return;
@@ -276,7 +120,7 @@ void TitleBarButtons::Render(Button& button) {
         Gdiplus::StringFormat format(Gdiplus::StringFormat::GenericTypographic());
         format.SetAlignment(Gdiplus::StringAlignmentCenter);
         format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-        const wchar_t glyph = isMuted_(button.exe) ? kMuteGlyph : kVolumeGlyph;
+        const wchar_t glyph = store::IsMuted(button.exe) ? kMuteGlyph : kVolumeGlyph;
         graphics.DrawString(&glyph, 1, &font,
                             Gdiplus::RectF(0, 0, static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height)),
                             &format, &brush);
@@ -293,26 +137,119 @@ void TitleBarButtons::Render(Button& button) {
     ReleaseDC(nullptr, screen);
 }
 
-LRESULT CALLBACK TitleBarButtons::ButtonProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_MOUSEACTIVATE:
-        return MA_NOACTIVATE;
-    case WM_DPICHANGED:
-        return 0;
-    case WM_MOUSEMOVE:
-    case WM_MOUSELEAVE:
-    case WM_LBUTTONDOWN:
-    case WM_LBUTTONUP:
-    case WM_CAPTURECHANGED:
-        if (g_self) g_self->OnMouse(reinterpret_cast<HWND>(GetWindowLongPtrW(wnd, GWLP_USERDATA)), msg, lp);
-        return 0;
-    }
-    return DefWindowProcW(wnd, msg, wp, lp);
+void Refresh(const std::wstring& exe) {
+    for (auto& [target, button] : g_buttons)
+        if (IsWindowVisible(button.wnd) && button.exe == exe) Render(button);
 }
 
-void TitleBarButtons::OnMouse(HWND target, UINT msg, LPARAM lp) {
-    const auto it = buttons_.find(target);
-    if (it == buttons_.end()) return;
+void Recolor() {
+    const HWND foreground = GetForegroundWindow();
+    for (auto& [target, button] : g_buttons) {
+        if (!IsWindowVisible(button.wnd)) continue;
+        const COLORREF caption = SampleCaption(button.rect);
+        const bool active = foreground == target;
+        if (caption == button.caption && active == button.active) continue;
+        button.caption = caption;
+        button.active = active;
+        Render(button);
+    }
+}
+
+void CALLBACK OnRecolorTimer(HWND, UINT, UINT_PTR id, DWORD) {
+    KillTimer(nullptr, id);
+    g_recolorTimer = 0;
+    Recolor();
+}
+
+void Place(HWND target, Button& button, const RECT& rect) {
+    const bool active = GetForegroundWindow() == target;
+    const bool moved = !EqualRect(&rect, &button.rect);
+    const bool resized = rect.right - rect.left != button.rect.right - button.rect.left ||
+                         rect.bottom - rect.top != button.rect.bottom - button.rect.top;
+    const bool wasVisible = IsWindowVisible(button.wnd);
+    button.rect = rect;
+    if (!wasVisible || resized || active != button.active) {
+        button.active = active;
+        Render(button);
+    }
+    if (!wasVisible || moved) ScheduleRecolor();
+
+    // Keep the overlay directly above its target in the Z order.
+    const bool topmost = IsTopmost(target);
+    if (topmost != IsTopmost(button.wnd))
+        SetWindowPos(button.wnd, topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    HWND above = GetWindow(target, GW_HWNDPREV);
+    if (above == button.wnd && wasVisible && !moved) return;
+    UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW;
+    HWND after = above;
+    if (above == button.wnd)
+        flags |= SWP_NOZORDER;
+    else if (!above || (!topmost && IsTopmost(above)))
+        after = topmost ? HWND_TOPMOST : HWND_TOP;
+    SetWindowPos(button.wnd, after, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, flags);
+}
+
+void Sync(HWND target) {
+    DWORD pid = 0;
+    if (!GetWindowThreadProcessId(target, &pid) || pid == GetCurrentProcessId()) return;
+    auto it = g_buttons.find(target);
+    RECT rect;
+    if (!ComputeButtonRect(target, &rect)) {
+        if (it != g_buttons.end()) ShowWindow(it->second.wnd, SW_HIDE);
+        return;
+    }
+    if (it == g_buttons.end()) {
+        Button button;
+        button.exe = ExePathOfProcess(pid);
+        if (button.exe.empty()) return;
+        button.wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kButtonClass, L"", WS_POPUP, 0,
+                                     0, 0, 0, nullptr, nullptr, g_instance, nullptr);
+        if (!button.wnd) return;
+        SetWindowLongPtrW(button.wnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(target));
+        it = g_buttons.emplace(target, std::move(button)).first;
+    }
+    Place(target, it->second, rect);
+}
+
+void SyncTracked() {
+    std::vector<HWND> targets;
+    targets.reserve(g_buttons.size());
+    for (const auto& [target, button] : g_buttons) targets.push_back(target);
+    for (HWND target : targets) Sync(target);
+}
+
+void Remove(HWND target) {
+    const auto it = g_buttons.find(target);
+    if (it == g_buttons.end()) return;
+    DestroyWindow(it->second.wnd);
+    g_buttons.erase(it);
+}
+
+void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
+    if (event == EVENT_SYSTEM_FOREGROUND || event == EVENT_OBJECT_REORDER) {
+        if (event == EVENT_SYSTEM_FOREGROUND && hwnd) Sync(hwnd);
+        SyncTracked();
+        ScheduleRecolor();
+        return;
+    }
+    if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+    if (event == EVENT_OBJECT_DESTROY)
+        Remove(hwnd);
+    else
+        Sync(hwnd);
+}
+
+void Toggle(const std::wstring& exe) {
+    const bool muted = !store::IsMuted(exe);
+    store::Set(exe, muted);
+    audio::Apply(exe, muted);
+    Refresh(exe);
+}
+
+void OnMouse(HWND target, UINT msg, LPARAM lp) {
+    const auto it = g_buttons.find(target);
+    if (it == g_buttons.end()) return;
     Button& button = it->second;
     const POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
     const RECT client{0, 0, button.rect.right - button.rect.left, button.rect.bottom - button.rect.top};
@@ -337,7 +274,7 @@ void TitleBarButtons::OnMouse(HWND target, UINT msg, LPARAM lp) {
         if (!button.pressed) break;
         button.pressed = false;
         ReleaseCapture();
-        if (PtInRect(&client, point)) toggle_(button.exe);
+        if (PtInRect(&client, point)) Toggle(button.exe);
         Render(button);
         return;
     case WM_CAPTURECHANGED:
@@ -349,3 +286,83 @@ void TitleBarButtons::OnMouse(HWND target, UINT msg, LPARAM lp) {
     button.pressed = pressed;
     Render(button);
 }
+
+LRESULT CALLBACK ButtonProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_DPICHANGED:
+        return 0;
+    case WM_MOUSEMOVE:
+    case WM_MOUSELEAVE:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED:
+        OnMouse(reinterpret_cast<HWND>(GetWindowLongPtrW(wnd, GWLP_USERDATA)), msg, lp);
+        return 0;
+    }
+    return DefWindowProcW(wnd, msg, wp, lp);
+}
+
+}  // namespace
+
+void Init(HINSTANCE instance) {
+    g_instance = instance;
+
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = ButtonProc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = kButtonClass;
+    if (!RegisterClassExW(&wc)) return;
+
+    Gdiplus::GdiplusStartupInput gdiplusInput;
+    if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr) != Gdiplus::Ok) return;
+
+    const DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+    const std::pair<DWORD, DWORD> ranges[] = {
+        {EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND},
+        {EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND},
+        {EVENT_OBJECT_DESTROY, EVENT_OBJECT_REORDER},
+        {EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE},
+        {EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED},
+    };
+    for (const auto& [first, last] : ranges)
+        if (HWINEVENTHOOK hook = SetWinEventHook(first, last, nullptr, OnWinEvent, 0, 0, flags)) g_hooks.push_back(hook);
+
+    Resync();
+}
+
+void Shutdown() {
+    for (HWINEVENTHOOK hook : g_hooks) UnhookWinEvent(hook);
+    g_hooks.clear();
+    if (g_recolorTimer) KillTimer(nullptr, g_recolorTimer);
+    g_recolorTimer = 0;
+    for (auto& [target, button] : g_buttons) DestroyWindow(button.wnd);
+    g_buttons.clear();
+    if (g_gdiplusToken) Gdiplus::GdiplusShutdown(g_gdiplusToken);
+    g_gdiplusToken = 0;
+}
+
+void Resync() {
+    for (auto it = g_buttons.begin(); it != g_buttons.end();) {
+        if (IsWindow(it->first)) {
+            ++it;
+            continue;
+        }
+        DestroyWindow(it->second.wnd);
+        it = g_buttons.erase(it);
+    }
+    EnumWindows(
+        [](HWND hwnd, LPARAM) -> BOOL {
+            Sync(hwnd);
+            return TRUE;
+        },
+        0);
+}
+
+void ScheduleRecolor() {
+    g_recolorTimer = SetTimer(nullptr, g_recolorTimer, kRecolorDelayMs, OnRecolorTimer);
+}
+
+}  // namespace buttons

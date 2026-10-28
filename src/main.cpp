@@ -3,12 +3,12 @@
 
 #include "audio.h"
 #include "buttons.h"
-#include "resource.h"
 #include "store.h"
 
 namespace {
 
 constexpr wchar_t kMainClass[] = L"DamnShutUp.Main";
+constexpr WORD kIconId = 1;  // ICON resource in app.rc
 constexpr UINT WM_APP_TRAY = WM_APP + 1;
 constexpr UINT WM_APP_AUDIO_SESSION = WM_APP + 2;
 constexpr UINT_PTR kResyncTimer = 1;
@@ -18,21 +18,18 @@ constexpr UINT kAudioIntervalMs = 2000;
 constexpr UINT kTrayId = 1;
 constexpr UINT kExitCommand = 1;
 
-MuteStore g_store;
-AudioMuter g_audio;
-TitleBarButtons g_buttons;
 UINT g_taskbarCreated = 0;
 
-void AddTrayIcon(HWND wnd, DWORD message) {
+void AddTrayIcon(HWND wnd) {
     NOTIFYICONDATAW data{sizeof(data)};
     data.hWnd = wnd;
     data.uID = kTrayId;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = WM_APP_TRAY;
-    data.hIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+    data.hIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(kIconId), IMAGE_ICON,
                                                GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
     wcscpy_s(data.szTip, L"DamnShutUp");
-    Shell_NotifyIconW(message, &data);
+    Shell_NotifyIconW(NIM_ADD, &data);
 }
 
 void ShowTrayMenu(HWND wnd) {
@@ -50,18 +47,18 @@ void ShowTrayMenu(HWND wnd) {
 LRESULT CALLBACK MainProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_TIMER:
-        if (wp == kResyncTimer) g_buttons.Resync();
-        if (wp == kAudioTimer) g_audio.Scan(g_store);
+        if (wp == kResyncTimer) buttons::Resync();
+        if (wp == kAudioTimer) audio::Scan();
         return 0;
     case WM_APP_AUDIO_SESSION:
-        g_audio.Scan(g_store);
+        audio::Scan();
         return 0;
     case WM_APP_TRAY:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_LBUTTONUP) ShowTrayMenu(wnd);
         return 0;
     case WM_SETTINGCHANGE:
     case WM_DWMCOLORIZATIONCOLORCHANGED:
-        g_buttons.ScheduleRecolor();
+        buttons::ScheduleRecolor();
         return 0;
     case WM_DESTROY: {
         NOTIFYICONDATAW data{sizeof(data)};
@@ -73,7 +70,7 @@ LRESULT CALLBACK MainProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     }
     if (msg == g_taskbarCreated && msg != 0) {
-        AddTrayIcon(wnd, NIM_ADD);
+        AddTrayIcon(wnd);
         return 0;
     }
     return DefWindowProcW(wnd, msg, wp, lp);
@@ -90,7 +87,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = MainProc;
     wc.hInstance = instance;
-    wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP));
+    wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(kIconId));
     wc.lpszClassName = kMainClass;
     RegisterClassExW(&wc);
     HWND wnd = CreateWindowExW(WS_EX_TOOLWINDOW, kMainClass, L"DamnShutUp", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
@@ -98,18 +95,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (!wnd) return 1;
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
-    g_store.Load();
-    g_audio.Init(wnd, WM_APP_AUDIO_SESSION);
-    g_audio.Scan(g_store);
-    g_buttons.Init(
-        instance, [](const std::wstring& exe) { return g_store.IsMuted(exe); },
-        [](const std::wstring& exe) {
-            const bool muted = !g_store.IsMuted(exe);
-            g_store.Set(exe, muted);
-            g_audio.Apply(exe, muted);
-            g_buttons.Refresh(exe);
-        });
-    AddTrayIcon(wnd, NIM_ADD);
+    store::Load();
+    audio::Init(wnd, WM_APP_AUDIO_SESSION);
+    audio::Scan();
+    buttons::Init(instance);
+    AddTrayIcon(wnd);
     SetTimer(wnd, kResyncTimer, kResyncIntervalMs, nullptr);
     SetTimer(wnd, kAudioTimer, kAudioIntervalMs, nullptr);
 
@@ -119,8 +109,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&msg);
     }
 
-    g_buttons.Shutdown();
-    g_audio.Shutdown();
+    buttons::Shutdown();
+    audio::Shutdown();
     CoUninitialize();
     CloseHandle(mutex);
     return 0;

@@ -1,42 +1,45 @@
 #include "audio.h"
 
+#include <audiopolicy.h>
+#include <mmdeviceapi.h>
+#include <wrl/client.h>
+#include <wrl/implements.h>
+
+#include <map>
+#include <set>
+
 #include "store.h"
 #include "util.h"
 
+using Microsoft::WRL::ClassicCom;
 using Microsoft::WRL::ComPtr;
+using Microsoft::WRL::RuntimeClass;
+using Microsoft::WRL::RuntimeClassFlags;
 
+namespace audio {
 namespace {
 
 // Called on a Core Audio worker thread: only posts to the UI thread.
-class SessionNotification final : public IAudioSessionNotification {
+class SessionNotification final : public RuntimeClass<RuntimeClassFlags<ClassicCom>, IAudioSessionNotification> {
 public:
     SessionNotification(HWND wnd, UINT msg) : wnd_(wnd), msg_(msg) {}
 
-    IFACEMETHODIMP QueryInterface(REFIID riid, void** object) override {
-        if (riid == __uuidof(IUnknown) || riid == __uuidof(IAudioSessionNotification)) {
-            *object = static_cast<IAudioSessionNotification*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *object = nullptr;
-        return E_NOINTERFACE;
-    }
-    IFACEMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&refs_); }
-    IFACEMETHODIMP_(ULONG) Release() override {
-        const ULONG refs = InterlockedDecrement(&refs_);
-        if (refs == 0) delete this;
-        return refs;
-    }
     IFACEMETHODIMP OnSessionCreated(IAudioSessionControl*) override {
         PostMessageW(wnd_, msg_, 0, 0);
         return S_OK;
     }
 
 private:
-    LONG refs_ = 1;
     HWND wnd_;
     UINT msg_;
 };
+
+using Endpoints = std::map<std::wstring, ComPtr<IAudioSessionManager2>>;  // by device id
+
+ComPtr<IMMDeviceEnumerator> g_enumerator;
+ComPtr<IAudioSessionNotification> g_notification;
+Endpoints g_endpoints;
+std::set<std::wstring> g_seen;  // session instance ids
 
 std::wstring SessionExe(IAudioSessionControl2* session) {
     DWORD pid = 0;
@@ -49,29 +52,18 @@ void SetMute(IAudioSessionControl2* session, bool muted) {
     if (SUCCEEDED(session->QueryInterface(IID_PPV_ARGS(&volume)))) volume->SetMute(muted, nullptr);
 }
 
-}  // namespace
-
-bool AudioMuter::Init(HWND notifyWnd, UINT notifyMsg) {
-    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator_)))) return false;
-    notification_.Attach(new SessionNotification(notifyWnd, notifyMsg));
-    return true;
+void Unregister(const Endpoints& endpoints) {
+    for (const auto& [id, manager] : endpoints) manager->UnregisterSessionNotification(g_notification.Get());
 }
 
-void AudioMuter::Shutdown() {
-    for (auto& [id, manager] : endpoints_) manager->UnregisterSessionNotification(notification_.Get());
-    endpoints_.clear();
-    notification_.Reset();
-    enumerator_.Reset();
-}
-
-void AudioMuter::RefreshEndpoints() {
-    if (!enumerator_) return;
+void RefreshEndpoints() {
+    if (!g_enumerator) return;
     ComPtr<IMMDeviceCollection> devices;
-    if (FAILED(enumerator_->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &devices))) return;
+    if (FAILED(g_enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &devices))) return;
     UINT count = 0;
     devices->GetCount(&count);
 
-    std::map<std::wstring, ComPtr<IAudioSessionManager2>> current;
+    Endpoints current;
     for (UINT i = 0; i < count; ++i) {
         ComPtr<IMMDevice> device;
         LPWSTR rawId = nullptr;
@@ -79,25 +71,25 @@ void AudioMuter::RefreshEndpoints() {
         const std::wstring id = rawId;
         CoTaskMemFree(rawId);
 
-        if (const auto known = endpoints_.find(id); known != endpoints_.end()) {
+        if (const auto known = g_endpoints.find(id); known != g_endpoints.end()) {
             current.emplace(id, std::move(known->second));
-            endpoints_.erase(known);
+            g_endpoints.erase(known);
             continue;
         }
         ComPtr<IAudioSessionManager2> manager;
         if (FAILED(device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr,
                                     reinterpret_cast<void**>(manager.GetAddressOf()))))
             continue;
-        manager->RegisterSessionNotification(notification_.Get());
+        manager->RegisterSessionNotification(g_notification.Get());
         current.emplace(id, std::move(manager));
     }
-    for (auto& [id, manager] : endpoints_) manager->UnregisterSessionNotification(notification_.Get());
-    endpoints_ = std::move(current);
+    Unregister(g_endpoints);
+    g_endpoints = std::move(current);
 }
 
 template <class F>
-void AudioMuter::ForEachSession(F&& visit) {
-    for (auto& [id, manager] : endpoints_) {
+void ForEachSession(F&& visit) {
+    for (auto& [id, manager] : g_endpoints) {
         ComPtr<IAudioSessionEnumerator> sessions;
         if (FAILED(manager->GetSessionEnumerator(&sessions))) continue;
         int count = 0;
@@ -111,7 +103,21 @@ void AudioMuter::ForEachSession(F&& visit) {
     }
 }
 
-void AudioMuter::Scan(const MuteStore& store) {
+}  // namespace
+
+void Init(HWND notifyWnd, UINT notifyMsg) {
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&g_enumerator)))) return;
+    g_notification = Microsoft::WRL::Make<SessionNotification>(notifyWnd, notifyMsg);
+}
+
+void Shutdown() {
+    Unregister(g_endpoints);
+    g_endpoints.clear();
+    g_notification.Reset();
+    g_enumerator.Reset();
+}
+
+void Scan() {
     RefreshEndpoints();
     std::set<std::wstring> present;
     ForEachSession([&](IAudioSessionControl2* session) {
@@ -119,17 +125,19 @@ void AudioMuter::Scan(const MuteStore& store) {
         if (FAILED(session->GetSessionInstanceIdentifier(&rawId))) return;
         std::wstring id = rawId;
         CoTaskMemFree(rawId);
-        const bool known = seen_.contains(id);
+        const bool known = g_seen.contains(id);
         present.insert(std::move(id));
         if (known) return;
-        if (const auto muted = store.Get(SessionExe(session))) SetMute(session, *muted);
+        if (const auto muted = store::Get(SessionExe(session))) SetMute(session, *muted);
     });
-    seen_ = std::move(present);
+    g_seen = std::move(present);
 }
 
-void AudioMuter::Apply(const std::wstring& exe, bool muted) {
+void Apply(const std::wstring& exe, bool muted) {
     RefreshEndpoints();
     ForEachSession([&](IAudioSessionControl2* session) {
         if (SessionExe(session) == exe) SetMute(session, muted);
     });
 }
+
+}  // namespace audio

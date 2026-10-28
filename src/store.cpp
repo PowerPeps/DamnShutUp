@@ -4,8 +4,13 @@
 #include <shlobj.h>
 
 #include <fstream>
+#include <map>
 
+namespace store {
 namespace {
+
+std::wstring g_path;
+std::map<std::wstring, bool> g_states;
 
 std::string ToUtf8(const std::wstring& text) {
     const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
@@ -21,44 +26,46 @@ std::wstring FromUtf8(const std::string& text) {
     return result;
 }
 
+void Save() {
+    if (g_path.empty()) return;
+    const std::wstring temp = g_path + L".tmp";
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        for (const auto& [exe, muted] : g_states) out << (muted ? '1' : '0') << '\t' << ToUtf8(exe) << '\n';
+        if (!out) return;
+    }
+    MoveFileExW(temp.c_str(), g_path.c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
 }  // namespace
 
-void MuteStore::Load() {
+void Load() {
     PWSTR localAppData = nullptr;
     if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &localAppData))) return;
     const std::wstring dir = std::wstring(localAppData) + L"\\DamnShutUp";
     CoTaskMemFree(localAppData);
     CreateDirectoryW(dir.c_str(), nullptr);
-    path_ = dir + L"\\mute.txt";
+    g_path = dir + L"\\mute.txt";
 
     // One "<0|1>\t<exe path>" entry per line.
-    std::ifstream in(path_, std::ios::binary);
+    std::ifstream in(g_path, std::ios::binary);
     std::string line;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.size() < 3 || line[1] != '\t' || (line[0] != '0' && line[0] != '1')) continue;
-        states_[FromUtf8(line.substr(2))] = line[0] == '1';
+        g_states[FromUtf8(line.substr(2))] = line[0] == '1';
     }
 }
 
-std::optional<bool> MuteStore::Get(const std::wstring& exe) const {
-    const auto it = states_.find(exe);
-    if (it == states_.end()) return std::nullopt;
+std::optional<bool> Get(const std::wstring& exe) {
+    const auto it = g_states.find(exe);
+    if (it == g_states.end()) return std::nullopt;
     return it->second;
 }
 
-void MuteStore::Set(const std::wstring& exe, bool muted) {
-    states_[exe] = muted;
+void Set(const std::wstring& exe, bool muted) {
+    g_states[exe] = muted;
     Save();
 }
 
-void MuteStore::Save() const {
-    if (path_.empty()) return;
-    const std::wstring temp = path_ + L".tmp";
-    {
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        for (const auto& [exe, muted] : states_) out << (muted ? '1' : '0') << '\t' << ToUtf8(exe) << '\n';
-        if (!out) return;
-    }
-    MoveFileExW(temp.c_str(), path_.c_str(), MOVEFILE_REPLACE_EXISTING);
-}
+}  // namespace store
