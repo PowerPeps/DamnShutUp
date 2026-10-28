@@ -10,10 +10,8 @@ constexpr wchar_t kMainClass[] = L"DamnShutUp.Main";
 constexpr WORD kIconId = 1;  // ICON resource in app.rc
 constexpr UINT WM_APP_TRAY = WM_APP + 1;
 constexpr UINT WM_APP_AUDIO_SESSION = WM_APP + 2;
-constexpr UINT_PTR kResyncTimer = 1;
-constexpr UINT_PTR kAudioTimer = 2;
-constexpr UINT kResyncIntervalMs = 1000;
-constexpr UINT kAudioIntervalMs = 2000;
+constexpr UINT_PTR kTimer = 1;
+constexpr UINT kTimerIntervalMs = 1000;
 constexpr UINT kTrayId = 1;
 constexpr UINT kExitCommand = 1;
 
@@ -46,8 +44,8 @@ void ShowTrayMenu(HWND wnd) {
 LRESULT CALLBACK MainProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_TIMER:
-        if (wp == kResyncTimer) buttons::Resync();
-        if (wp == kAudioTimer) audio::Scan();
+        buttons::Resync();
+        audio::Scan();
         return 0;
     case WM_APP_AUDIO_SESSION:
         audio::Scan();
@@ -98,8 +96,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     audio::Scan();
     buttons::Init(instance);
     AddTrayIcon(wnd);
-    SetTimer(wnd, kResyncTimer, kResyncIntervalMs, nullptr);
-    SetTimer(wnd, kAudioTimer, kAudioIntervalMs, nullptr);
+    SetTimer(wnd, kTimer, kTimerIntervalMs, nullptr);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
