@@ -242,7 +242,7 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, L
 
 void Toggle(const std::wstring& exe) {
     const bool muted = !store::IsMuted(exe);
-    store::Set(exe, muted);
+    store::SetMuted(exe, muted);
     audio::Apply(exe, muted);
     Refresh(exe);
 }

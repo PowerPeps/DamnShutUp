@@ -3,7 +3,6 @@
 
 #include "audio.h"
 #include "buttons.h"
-#include "store.h"
 
 namespace {
 
@@ -95,7 +94,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (!wnd) return 1;
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
-    store::Load();
     audio::Init(wnd, WM_APP_AUDIO_SESSION);
     audio::Scan();
     buttons::Init(instance);

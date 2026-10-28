@@ -17,4 +17,4 @@ add_executable(DamnShutUp WIN32
 
 target_compile_definitions(DamnShutUp PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 target_compile_options(DamnShutUp PRIVATE /W4 /permissive- /utf-8)
-target_link_libraries(DamnShutUp PRIVATE ole32 gdiplus dwmapi shell32)
+target_link_libraries(DamnShutUp PRIVATE ole32 advapi32 gdiplus dwmapi shell32)

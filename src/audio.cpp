@@ -128,7 +128,7 @@ void Scan() {
         const bool known = g_seen.contains(id);
         present.insert(std::move(id));
         if (known) return;
-        if (const auto muted = store::Get(SessionExe(session))) SetMute(session, *muted);
+        if (store::IsMuted(SessionExe(session))) SetMute(session, true);
     });
     g_seen = std::move(present);
 }
