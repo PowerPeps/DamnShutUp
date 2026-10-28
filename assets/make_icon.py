@@ -129,7 +129,7 @@ col *= (1 - 0.65 * corner)[..., None]
 # bar
 p0 = np.array([170.0, 170.0])
 p1 = np.array([854.0, 854.0])
-r_bar, gap = 54.0, 26.0
+r_bar, gap = 54.0, 0.0
 d = p1 - p0
 P = np.stack([X, Y], axis=-1)
 s = np.clip(((P - p0) @ d) / (d @ d), 0, 1)
